@@ -123,14 +123,14 @@ class AnomalyDetector:
             }
         return self.ewma_state[metric]
 
-    def detect_zscore(self, metric: str, value: float,
+    def detect_zscore(self, series_key: str, value: float,
                       window_size: int = 200,
                       threshold: float = 3.0) -> Tuple[bool, float, Dict]:
         """
         Z-score anomaly detection.
         Returns: (is_anomaly, z_score, details)
         """
-        window = self._get_window(metric, window_size)
+        window = self._get_window(series_key, window_size)
         window.add(value)
 
         if window.count < 10:  # Need minimum samples
@@ -154,14 +154,14 @@ class AnomalyDetector:
             "window_size": window.count
         }
 
-    def detect_ewma(self, metric: str, value: float,
+    def detect_ewma(self, series_key: str, value: float,
                     alpha: float = 0.3,
                     threshold_sigma: float = 3.0) -> Tuple[bool, float, Dict]:
         """
         EWMA (Exponentially Weighted Moving Average) anomaly detection.
         Good for detecting gradual shifts in the mean.
         """
-        state = self._get_ewma_state(metric, alpha)
+        state = self._get_ewma_state(series_key, alpha)
 
         if state["initialized"] == 0:
             state["ewma"] = value
@@ -196,7 +196,7 @@ class AnomalyDetector:
             "alpha": alpha
         }
 
-    def detect_moving_median(self, metric: str, value: float,
+    def detect_moving_median(self, series_key: str, value: float,
                              window_size: int = 100,
                              threshold: float = 3.0) -> Tuple[bool, float, Dict]:
         """
@@ -204,7 +204,7 @@ class AnomalyDetector:
         More robust to outliers than mean-based methods.
         Uses Median Absolute Deviation (MAD) instead of standard deviation.
         """
-        window = self._get_window(f"{metric}_median", window_size)
+        window = self._get_window(f"{series_key}_median", window_size)
         window.add(value)
 
         if window.count < 10:
@@ -234,11 +234,14 @@ class AnomalyDetector:
             "percentile_75": round(window.percentile(75), 4)
         }
 
-    def detect(self, metric: str, value: float, rule: Dict) -> Tuple[bool, Dict]:
+    def detect(self, metric: str, value: float, rule: Dict,
+               environment: Optional[str] = None) -> Tuple[bool, Dict]:
         """
         Run detection based on rule configuration.
         Returns: (is_anomaly, detection_result)
         """
+        env = environment or "default"
+        series_key = f"{env}:{metric}"
         algorithm = rule.get("algorithm", "zscore")
         params = rule.get("params", {})
         threshold = rule.get("threshold", 3.0)
@@ -246,19 +249,19 @@ class AnomalyDetector:
 
         if algorithm == "zscore":
             is_anomaly, score, details = self.detect_zscore(
-                metric, value,
+                series_key, value,
                 window_size=params.get("window_size", 200),
                 threshold=threshold
             )
         elif algorithm == "ewma":
             is_anomaly, score, details = self.detect_ewma(
-                metric, value,
+                series_key, value,
                 alpha=params.get("alpha", 0.3),
                 threshold_sigma=threshold
             )
         elif algorithm == "moving_median":
             is_anomaly, score, details = self.detect_moving_median(
-                metric, value,
+                series_key, value,
                 window_size=params.get("window_size", 100),
                 threshold=threshold
             )
@@ -268,7 +271,7 @@ class AnomalyDetector:
         # Dynamic threshold adjustment
         if dynamic and is_anomaly:
             # Use percentile-based threshold to reduce false positives
-            window_key = f"{metric}_window"
+            window_key = f"{series_key}_window"
             if window_key in self.windows:
                 window = self.windows[window_key]
                 if window.count >= 50:
@@ -281,6 +284,7 @@ class AnomalyDetector:
 
         result = {
             "metric": metric,
+            "environment": env,
             "value": value,
             "algorithm": algorithm,
             "is_anomaly": is_anomaly,

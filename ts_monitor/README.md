@@ -32,9 +32,9 @@ python3 server.py 8080
 
 ### 前端（5 个页面）
 
-1. **实时仪表盘** - ECharts 多指标曲线图、热力图、统计卡片
-2. **数据源配置** - 管理 API/模拟器/文件数据源
-3. **历史查询** - 时间范围选择、LTTB 降采样、CSV 导出
+1. **实时仪表盘** - 按生产/预发/开发环境分组，支持同一指标跨环境叠加对比
+2. **数据源配置** - 管理 API/模拟器/文件数据源，每个数据源归属于独立环境
+3. **历史查询** - 多环境选择、同一指标叠加、LTTB 降采样、CSV 导出
 4. **异常告警** - 告警列表、状态过滤、确认/解决操作
 5. **规则管理** - CRUD 检测规则、多算法配置
 
@@ -59,12 +59,12 @@ python3 server.py 8080
 # 单点摄入
 curl -X POST http://localhost:8080/api/data/ingest \
   -H "Content-Type: application/json" \
-  -d '{"metric":"cpu.usage","value":72.5,"timestamp":1695000000}'
+  -d '{"metric":"cpu.usage","value":72.5,"timestamp":1695000000,"environment":"production","tags":{"env":"production"}}'
 
 # 批量摄入
 curl -X POST http://localhost:8080/api/data/ingest/batch \
   -H "Content-Type: application/json" \
-  -d '{"points":[{"metric":"cpu.usage","value":72.5},{"metric":"mem","value":4.2}]}'
+  -d '{"points":[{"metric":"cpu.usage","value":72.5,"environment":"production"},{"metric":"mem","value":4.2,"environment":"staging"}]}'
 ```
 
 ### 数据查询
@@ -74,7 +74,13 @@ curl -X POST http://localhost:8080/api/data/ingest/batch \
 curl "http://localhost:8080/api/data/query?metric=cpu.usage&start=1695000000&end=1695003600"
 
 # 降采样查询
-curl "http://localhost:8080/api/data/downsample?metric=cpu.usage&start=1695000000&end=1695003600&target=200&method=lttb"
+curl "http://localhost:8080/api/data/downsample?metric=cpu.usage&environment=production&start=1695000000&end=1695003600&target=200&method=lttb"
+
+# 多环境同指标叠加查询
+curl "http://localhost:8080/api/data/compare?metric=cpu.usage&start=1695000000&end=1695003600&target=200&environment=production&environment=staging&environment=development"
+
+# 环境列表
+curl "http://localhost:8080/api/environments"
 ```
 
 ### 规则管理
@@ -122,9 +128,10 @@ curl -X POST http://localhost:8080/api/simulate \
 
 ```
 data/timeseries/
-├── cpu_usage_20260923_04.json
-├── cpu_usage_20260923_05.json
-├── memory_usage_20260923_04.json
+├── cpu_usage__production_20260923_04.json
+├── cpu_usage__staging_20260923_04.json
+├── cpu_usage__development_20260923_04.json
+├── memory_usage__production_20260923_04.json
 └── ...
 ```
 
@@ -136,8 +143,8 @@ data/timeseries/
 {
   "t": 1695000000.123,  // 时间戳（秒，保留3位小数）
   "v": 72.5,            // 值
-  "tags": {"host": "s1"}, // 标签
-  "src": "api"           // 来源
+  "tags": {"host": "s1", "env": "production"}, // 标签，env 标识环境
+  "src": "simulator-production"       // 来源
 }
 ```
 

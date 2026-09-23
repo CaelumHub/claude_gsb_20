@@ -1031,6 +1031,115 @@ textarea.form-input {
 .metric-chip.active[data-metric="disk"] { background: var(--warning-dim); border-color: var(--warning); color: var(--warning); }
 .metric-chip.active[data-metric="network"] { background: rgba(6,182,212,.15); border-color: var(--cyan); color: var(--cyan); }
 
+/* ---- Environment selectors ---- */
+.env-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.env-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s;
+}
+
+.env-chip:hover { border-color: var(--border-light); }
+.env-chip.active {
+  background: color-mix(in srgb, var(--env-color, #3b82f6) 16%, transparent);
+  border-color: var(--env-color, #3b82f6);
+  color: var(--env-color, #3b82f6);
+}
+
+.env-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.env-checkbox input { accent-color: var(--env-color, #3b82f6); }
+
+.environment-groups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.env-group-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  overflow: hidden;
+}
+
+.env-group-header {
+  padding: 12px 14px;
+  border-top: 3px solid var(--env-color, #3b82f6);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: color-mix(in srgb, var(--env-color, #3b82f6) 6%, transparent);
+}
+
+.env-group-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.env-group-body { padding: 12px 14px; }
+
+.env-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.env-mini-stat {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+}
+
+.env-mini-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.env-mini-value {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.env-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--env-color, #3b82f6);
+  margin-right: 6px;
+}
+
+@media (max-width: 1100px) {
+  .environment-groups { grid-template-columns: 1fr; }
+}
+
 /* ---- Sparkline ---- */
 .sparkline-container {
   width: 80px;
@@ -1132,8 +1241,9 @@ textarea.form-input {
         <div class="grid-2" style="margin-bottom:16px">
           <div class="card">
             <div class="card-header">
-              <div class="card-title">📈 实时指标曲线</div>
-              <div class="metric-chips" id="dashMetricChips"></div>
+              <div class="card-title">📈 跨环境指标对比</div>
+              <div class="env-chips" id="dashEnvChips"></div>
+              <div class="metric-chips" id="dashMetricChips" style="margin-bottom:0"></div>
             </div>
             <div class="card-body">
               <div class="chart-container large" id="dashLineChart"></div>
@@ -1153,6 +1263,9 @@ textarea.form-input {
             </div>
           </div>
         </div>
+
+        <div class="section-title" style="margin-bottom:10px">🌍 按环境分组查看</div>
+        <div class="environment-groups" id="environmentGroups"></div>
 
         <div class="card">
           <div class="card-header">
@@ -1200,8 +1313,9 @@ textarea.form-input {
   "metric": "cpu.usage",
   "value": 72.5,
   "timestamp": 1695000000,
-  "tags": {"host": "server-01"},
-  "source": "api"
+  "environment": "production",
+  "tags": {"host": "server-01", "env": "production"},
+  "source": "simulator-production"
 }</textarea>
               </div>
             </div>
@@ -1252,6 +1366,10 @@ textarea.form-input {
                 </select>
               </div>
             </div>
+            <div class="form-group">
+              <label class="form-label">选择环境（可多选叠加）</label>
+              <div class="env-chips" id="historyEnvChips"></div>
+            </div>
             <div class="form-row" style="margin-bottom:12px">
               <div class="form-group">
                 <label class="form-label">开始时间</label>
@@ -1283,7 +1401,7 @@ textarea.form-input {
         <div class="grid-2">
           <div class="card">
             <div class="card-header">
-              <div class="card-title">📉 降采样结果</div>
+              <div class="card-title">📉 多环境叠加对比</div>
               <span class="badge badge-info" id="downsampleInfo">-</span>
             </div>
             <div class="card-body">
@@ -1314,6 +1432,7 @@ textarea.form-input {
                 <thead>
                   <tr>
                     <th>时间戳</th>
+                    <th>环境</th>
                     <th>值</th>
                     <th>来源</th>
                     <th>标签</th>
@@ -1484,6 +1603,16 @@ textarea.form-input {
           </select>
         </div>
         <div class="form-group">
+          <label class="form-label">所属环境</label>
+          <select class="form-select" id="sourceEnvironment">
+            <option value="production">生产环境 (production)</option>
+            <option value="staging">预发环境 (staging)</option>
+            <option value="development">开发环境 (development)</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
           <label class="form-label">采样间隔 (秒)</label>
           <input class="form-input" id="sourceInterval" type="number" value="1">
         </div>
@@ -1515,16 +1644,31 @@ textarea.form-input {
 const API_BASE = window.location.origin;
 const REFRESH_INTERVAL = 2000;
 const CHART_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#06b6d4', '#8b5cf6', '#ec4899', '#f97316', '#14b8a6'];
+const ENV_COLORS = {
+  production: '#3b82f6',
+  staging: '#f59e0b',
+  development: '#10b981',
+  default: '#8b5cf6'
+};
+const ENV_NAMES = {
+  production: '生产环境',
+  staging: '预发环境',
+  development: '开发环境',
+  default: '默认环境'
+};
 
 // ====== State ======
 let state = {
   currentPage: 'dashboard',
   metrics: [],
+  environments: [],
+  selectedEnvironments: new Set(['production', 'staging', 'development']),
+  selectedHistoryEnvironments: new Set(['production', 'staging', 'development']),
   dashboardData: null,
   alerts: [],
   rules: [],
   sources: {},
-  selectedDashMetrics: new Set(['cpu.usage', 'memory.usage']),
+  selectedDashMetrics: new Set(['cpu.usage']),
   historyData: null,
   timeRangeMinutes: 15,
 };
@@ -1587,6 +1731,7 @@ async function api(path, options = {}) {
 
 // ====== Data Loading ======
 async function loadData() {
+  await loadEnvironments();
   await Promise.all([
     loadDashboard(),
     loadAlerts(),
@@ -1617,31 +1762,28 @@ async function loadDashboard() {
   }
   document.getElementById('serverStatus').textContent = '已连接';
   state.dashboardData = data;
-  state.metrics = Object.keys(data.metrics || {});
+  state.metrics = data.metrics?.length ? data.metrics : Object.keys(data.environments || {});
 
   renderStatsGrid(data);
+  renderDashEnvChips();
   renderDashMetricChips();
   renderDashLineChart(data);
   renderDashHeatmap(data);
+  renderEnvironmentGroups(data);
   renderRecentAlerts(data.recent_alerts || []);
 }
 
 function renderStatsGrid(data) {
   const stats = data.stats || {};
-  const metrics = data.metrics || {};
-  const metricKeys = Object.keys(metrics);
-
-  let currentVals = metricKeys.map(m => metrics[m]?.current || 0);
-  let avgVals = metricKeys.map(m => metrics[m]?.avg || 0);
 
   const html = `
     <div class="stat-card blue">
-      <div class="stat-label">总指标数</div>
+      <div class="stat-label">监控指标</div>
       <div class="stat-value">${stats.metric_count || 0}</div>
     </div>
     <div class="stat-card green">
-      <div class="stat-label">数据分片</div>
-      <div class="stat-value">${stats.shard_count || 0}</div>
+      <div class="stat-label">监控环境</div>
+      <div class="stat-value">${stats.environment_count || 0}</div>
     </div>
     <div class="stat-card yellow">
       <div class="stat-label">存储大小</div>
@@ -1663,6 +1805,51 @@ function renderStatsGrid(data) {
   document.getElementById('statsGrid').innerHTML = html;
 }
 
+function getEnvColor(env) {
+  return ENV_COLORS[env] || CHART_COLORS[state.environments.indexOf(env) % CHART_COLORS.length] || '#8b5cf6';
+}
+
+function getEnvName(env) {
+  return ENV_NAMES[env] || env;
+}
+
+async function loadEnvironments() {
+  const data = await api('/api/environments');
+  if (!data) return;
+  state.environments = (data.environments || []).map(e => e.id || e.name);
+  state.environments.forEach(env => {
+    state.selectedEnvironments.add(env);
+    state.selectedHistoryEnvironments.add(env);
+  });
+  renderDashEnvChips();
+  renderHistoryEnvChips();
+}
+
+function renderDashEnvChips() {
+  const container = document.getElementById('dashEnvChips');
+  if (!container) return;
+  container.innerHTML = state.environments.map(env => {
+    const active = state.selectedEnvironments.has(env) ? 'active' : '';
+    return `<span class="env-chip ${active}" style="--env-color:${getEnvColor(env)}" onclick="toggleDashEnvironment('${env}')">${getEnvName(env)}</span>`;
+  }).join('');
+}
+
+function toggleDashEnvironment(env) {
+  if (state.selectedEnvironments.has(env)) {
+    if (state.selectedEnvironments.size === 1) {
+      showToast('至少保留一个环境', 'warning');
+      return;
+    }
+    state.selectedEnvironments.delete(env);
+  } else {
+    state.selectedEnvironments.add(env);
+  }
+  renderDashEnvChips();
+  renderDashLineChart(state.dashboardData);
+  renderDashHeatmap(state.dashboardData);
+  renderEnvironmentGroups(state.dashboardData);
+}
+
 function renderDashMetricChips() {
   const container = document.getElementById('dashMetricChips');
   const chips = state.metrics.map(m => {
@@ -1674,38 +1861,44 @@ function renderDashMetricChips() {
 }
 
 function toggleDashMetric(metric) {
-  if (state.selectedDashMetrics.has(metric)) {
-    state.selectedDashMetrics.delete(metric);
-  } else {
-    state.selectedDashMetrics.add(metric);
-  }
+  state.selectedDashMetrics.clear();
+  state.selectedDashMetrics.add(metric);
   renderDashMetricChips();
   renderDashLineChart(state.dashboardData);
+  renderDashHeatmap(state.dashboardData);
 }
 
 function renderDashLineChart(data) {
-  if (!lineChart || !data?.metrics) return;
+  if (!lineChart || !data?.environments) return;
+
+  const metric = [...state.selectedDashMetrics][0] || state.metrics[0];
+  if (!metric) return;
 
   const series = [];
-  const selectedMetrics = [...state.selectedDashMetrics];
-
-  selectedMetrics.forEach((metric, i) => {
-    const md = data.metrics[metric];
+  state.environments.forEach(env => {
+    if (!state.selectedEnvironments.has(env)) return;
+    const md = data.environments[env]?.metrics?.[metric];
     if (!md?.data) return;
 
     series.push({
-      name: metric,
+      name: `${getEnvName(env)} · ${env}`,
       type: 'line',
       smooth: true,
       symbol: 'none',
       lineStyle: { width: 2 },
-      areaStyle: { opacity: 0.08 },
-      color: CHART_COLORS[i % CHART_COLORS.length],
+      areaStyle: { opacity: 0.04 },
+      color: getEnvColor(env),
       data: md.data.map(p => [p.t * 1000, p.v]),
     });
   });
 
   lineChart.setOption({
+    title: {
+      text: metric,
+      left: 0,
+      top: 0,
+      textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono', fontWeight: 400 }
+    },
     tooltip: {
       trigger: 'axis',
       backgroundColor: 'rgba(15,23,42,0.95)',
@@ -1715,9 +1908,10 @@ function renderDashLineChart(data) {
     },
     legend: {
       top: 0,
+      right: 0,
       textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
-    grid: { left: 50, right: 20, top: 30, bottom: 30 },
+    grid: { left: 50, right: 20, top: 36, bottom: 30 },
     xAxis: {
       type: 'time',
       axisLine: { lineStyle: { color: '#1e2d42' } },
@@ -1737,23 +1931,23 @@ function renderDashLineChart(data) {
 }
 
 function renderDashHeatmap(data) {
-  if (!heatmapChart || !data?.metrics) return;
+  if (!heatmapChart || !data?.environments) return;
 
-  const metrics = Object.keys(data.metrics);
-  const hours = 24;
+  const metric = [...state.selectedDashMetrics][0] || state.metrics[0];
+  const envs = state.environments.filter(env => state.selectedEnvironments.has(env));
   const heatData = [];
+  const yLabels = [];
 
-  metrics.forEach((metric, yi) => {
-    const md = data.metrics[metric];
+  envs.forEach((env, yi) => {
+    yLabels.push(`${getEnvName(env)} / ${metric}`);
+    const md = data.environments[env]?.metrics?.[metric];
     if (!md?.data) return;
-    // Group by minute
+
     const buckets = {};
     md.data.forEach(p => {
-      const d = new Date(p.t * 1000);
-      const minute = d.getMinutes();
-      const key = minute;
-      if (!buckets[key]) buckets[key] = [];
-      buckets[key].push(p.v);
+      const minute = new Date(p.t * 1000).getMinutes();
+      if (!buckets[minute]) buckets[minute] = [];
+      buckets[minute].push(p.v);
     });
     Object.entries(buckets).forEach(([min, vals]) => {
       const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
@@ -1768,10 +1962,10 @@ function renderDashHeatmap(data) {
       textStyle: { color: '#e2e8f0', fontSize: 11, fontFamily: 'JetBrains Mono' },
       formatter: p => {
         const [x, y, v] = p.data;
-        return `${metrics[y]}<br/>分钟: ${x}<br/>均值: ${v}`;
+        return `${yLabels[y]}<br/>分钟: ${x}<br/>均值: ${v}`;
       },
     },
-    grid: { left: 120, right: 30, top: 10, bottom: 40 },
+    grid: { left: 160, right: 30, top: 10, bottom: 40 },
     xAxis: {
       type: 'category',
       data: Array.from({length: 60}, (_, i) => i),
@@ -1780,7 +1974,7 @@ function renderDashHeatmap(data) {
     },
     yAxis: {
       type: 'category',
-      data: metrics,
+      data: yLabels,
       axisLabel: { color: '#94a3b8', fontSize: 10, fontFamily: 'JetBrains Mono' },
       axisLine: { lineStyle: { color: '#1e2d42' } },
     },
@@ -1806,6 +2000,39 @@ function renderDashHeatmap(data) {
   }, true);
 }
 
+function renderEnvironmentGroups(data) {
+  const container = document.getElementById('environmentGroups');
+  if (!container || !data?.environments) return;
+  const metric = [...state.selectedDashMetrics][0] || state.metrics[0];
+  const visibleEnvs = state.environments.filter(env => state.selectedEnvironments.has(env));
+
+  container.innerHTML = visibleEnvs.map(env => {
+    const envData = data.environments[env];
+    const md = envData?.metrics?.[metric];
+    const stat = (label, value) => `
+      <div class="env-mini-stat">
+        <div class="env-mini-label">${label}</div>
+        <div class="env-mini-value">${value ?? '-'}</div>
+      </div>`;
+    return `
+      <div class="env-group-card" style="--env-color:${getEnvColor(env)}">
+        <div class="env-group-header">
+          <div class="env-group-title"><span class="env-dot"></span>${getEnvName(env)}</div>
+          <span class="badge badge-info">${env}</span>
+        </div>
+        <div class="env-group-body">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono)">${metric}</div>
+          <div class="env-mini-grid">
+            ${stat('当前', md?.current?.toFixed(2))}
+            ${stat('均值', md?.avg?.toFixed(2))}
+            ${stat('最小', md?.min?.toFixed(2))}
+            ${stat('最大', md?.max?.toFixed(2))}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
 function renderRecentAlerts(alerts) {
   const container = document.getElementById('recentAlerts');
   if (!alerts.length) {
@@ -1817,7 +2044,7 @@ function renderRecentAlerts(alerts) {
     <div class="alert-item">
       <div class="alert-severity ${a.severity || 'warning'}"></div>
       <div class="alert-content">
-        <div class="alert-title">${a.metric} - ${a.rule_name || a.algorithm || '异常检测'}</div>
+        <div class="alert-title">${a.metric} · ${getEnvName(a.environment || a.tags?.env || 'default')} - ${a.rule_name || a.algorithm || '异常检测'}</div>
         <div class="alert-meta">
           <span>值: ${a.value?.toFixed(2) ?? '-'}</span>
           <span>评分: ${a.score?.toFixed(2) ?? '-'}</span>
@@ -1855,7 +2082,7 @@ function renderSources() {
         <div class="source-icon ${iconClass}">${icon}</div>
         <div class="source-info">
           <div class="source-name">${s.name || id}</div>
-          <div class="source-type">${s.type} · ${s.enabled ? '启用' : '禁用'} · ${(s.metrics || []).join(', ')}</div>
+          <div class="source-type">${getEnvName(s.environment || s.env || 'default')} · ${s.type} · ${s.enabled ? '启用' : '禁用'} · ${(s.metrics || []).join(', ')}</div>
         </div>
         <div class="source-actions">
           <span class="badge ${s.enabled ? 'badge-success' : 'badge-warning'}">${s.enabled ? '在线' : '离线'}</span>
@@ -1871,6 +2098,7 @@ function showAddSourceModal() {
   document.getElementById('sourceType').value = 'api';
   document.getElementById('sourceInterval').value = '1';
   document.getElementById('sourceMetrics').value = '';
+  document.getElementById('sourceEnvironment').value = 'production';
   document.getElementById('sourceEnabled').checked = true;
   openModal('sourceModal');
 }
@@ -1882,6 +2110,7 @@ async function saveSource() {
   const source = {
     name,
     type: document.getElementById('sourceType').value,
+    environment: document.getElementById('sourceEnvironment').value,
     interval: parseInt(document.getElementById('sourceInterval').value) || 1,
     metrics: document.getElementById('sourceMetrics').value.split(',').map(s => s.trim()).filter(Boolean),
     enabled: document.getElementById('sourceEnabled').checked,
@@ -1922,6 +2151,32 @@ async function loadMetrics() {
   }
 }
 
+function renderHistoryEnvChips() {
+  const container = document.getElementById('historyEnvChips');
+  if (!container) return;
+  container.innerHTML = state.environments.map(env => {
+    const checked = state.selectedHistoryEnvironments.has(env) ? 'checked' : '';
+    return `
+      <label class="env-checkbox" style="--env-color:${getEnvColor(env)}">
+        <input type="checkbox" value="${env}" ${checked} onchange="toggleHistoryEnvironment('${env}')">
+        ${getEnvName(env)}
+      </label>`;
+  }).join('');
+}
+
+function toggleHistoryEnvironment(env) {
+  if (state.selectedHistoryEnvironments.has(env)) {
+    if (state.selectedHistoryEnvironments.size === 1) {
+      showToast('至少选择一个环境', 'warning');
+      renderHistoryEnvChips();
+      return;
+    }
+    state.selectedHistoryEnvironments.delete(env);
+  } else {
+    state.selectedHistoryEnvironments.add(env);
+  }
+}
+
 function setTimeRange(minutes) {
   state.timeRangeMinutes = minutes;
   document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
@@ -1942,6 +2197,9 @@ async function queryHistory() {
   const target = parseInt(document.getElementById('targetPoints').value) || 300;
   const method = document.getElementById('downsampleMethod').value;
 
+  const environments = [...state.selectedHistoryEnvironments];
+  if (!environments.length) { showToast('请选择至少一个环境', 'error'); return; }
+
   let start, end;
   if (startStr && endStr) {
     start = new Date(startStr).getTime() / 1000;
@@ -1951,15 +2209,23 @@ async function queryHistory() {
     start = end - state.timeRangeMinutes * 60;
   }
 
-  showToast('正在查询...', 'info');
+  showToast('正在跨环境查询...', 'info');
 
-  const data = await api(`/api/data/downsample?metric=${encodeURIComponent(metric)}&start=${start}&end=${end}&target=${target}&method=${method}`);
+  const params = new URLSearchParams({
+    metric,
+    start,
+    end,
+    target,
+    method,
+  });
+  environments.forEach(env => params.append('environment', env));
+  const data = await api(`/api/data/compare?${params.toString()}`);
   if (!data) { showToast('查询失败', 'error'); return; }
 
   state.historyData = data;
   renderHistoryChart(data, metric);
   renderHistoryStats(data);
-  renderHistoryTable(data.data || []);
+  renderHistoryTable(data.series || []);
   document.getElementById('downsampleInfo').textContent = `${data.original_count} → ${data.downsampled_count} 点`;
   showToast(`查询完成: ${data.downsampled_count} 点`, 'success');
 }
@@ -1967,9 +2233,24 @@ async function queryHistory() {
 function renderHistoryChart(data, metric) {
   if (!historyChartInstance) return;
 
-  const points = (data.data || []).map(p => [p.t * 1000, p.v]);
+  const series = (data.series || []).map(item => ({
+    name: `${getEnvName(item.environment)} · ${item.environment}`,
+    type: 'line',
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 2, color: getEnvColor(item.environment) },
+    itemStyle: { color: getEnvColor(item.environment) },
+    areaStyle: { opacity: 0.03 },
+    data: item.data.map(p => [p.t * 1000, p.v]),
+  }));
 
   historyChartInstance.setOption({
+    title: {
+      text: metric,
+      left: 0,
+      top: 0,
+      textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono', fontWeight: 400 }
+    },
     tooltip: {
       trigger: 'axis',
       backgroundColor: 'rgba(15,23,42,0.95)',
@@ -1977,11 +2258,11 @@ function renderHistoryChart(data, metric) {
       textStyle: { color: '#e2e8f0', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
     legend: {
-      data: [metric],
       top: 0,
+      right: 0,
       textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
-    grid: { left: 50, right: 20, top: 30, bottom: 30 },
+    grid: { left: 50, right: 20, top: 36, bottom: 58 },
     xAxis: {
       type: 'time',
       axisLine: { lineStyle: { color: '#1e2d42' } },
@@ -1994,20 +2275,7 @@ function renderHistoryChart(data, metric) {
       axisLabel: { color: '#64748b', fontSize: 10, fontFamily: 'JetBrains Mono' },
       splitLine: { lineStyle: { color: '#1e2d42', type: 'dashed' } },
     },
-    series: [{
-      name: metric,
-      type: 'line',
-      smooth: true,
-      symbol: 'none',
-      lineStyle: { width: 2, color: '#3b82f6' },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(59,130,246,0.3)' },
-          { offset: 1, color: 'rgba(59,130,246,0.02)' },
-        ]),
-      },
-      data: points,
-    }],
+    series,
     dataZoom: [
       { type: 'inside', start: 0, end: 100 },
       { type: 'slider', start: 0, end: 100, height: 20, bottom: 5,
@@ -2020,35 +2288,50 @@ function renderHistoryChart(data, metric) {
 }
 
 function renderHistoryStats(data) {
-  const values = (data.data || []).map(p => p.v);
-  if (!values.length) return;
+  const series = data.series || [];
+  if (!series.length) return;
 
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const avg = values.reduce((s, v) => s + v, 0) / values.length;
-  const sorted = [...values].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  const std = Math.sqrt(values.reduce((s, v) => s + (v - avg) ** 2, 0) / values.length);
+  const diff = data.comparison;
+  const diffBanner = diff ? `
+    <div class="env-mini-stat" style="grid-column:1/-1;margin-bottom:4px">
+      <div class="env-mini-label">当前值跨环境差异</div>
+      <div class="env-mini-value">${diff.current_delta?.toFixed(2) ?? '-'}</div>
+      <div style="font-size:10px;color:var(--text-muted);margin-top:4px">
+        最高 ${getEnvName(diff.current_max_environment)} · 最低 ${getEnvName(diff.current_min_environment)}
+      </div>
+    </div>` : '';
 
   document.getElementById('historyStats').innerHTML = `
-    <div class="stats-grid" style="margin:0">
-      <div class="stat-card blue"><div class="stat-label">最小值</div><div class="stat-value">${min.toFixed(2)}</div></div>
-      <div class="stat-card green"><div class="stat-label">最大值</div><div class="stat-value">${max.toFixed(2)}</div></div>
-      <div class="stat-card yellow"><div class="stat-label">均值</div><div class="stat-value">${avg.toFixed(2)}</div></div>
-      <div class="stat-card purple"><div class="stat-label">中位数</div><div class="stat-value">${median.toFixed(2)}</div></div>
-      <div class="stat-card cyan"><div class="stat-label">标准差</div><div class="stat-value">${std.toFixed(2)}</div></div>
-      <div class="stat-card red"><div class="stat-label">数据点</div><div class="stat-value">${values.length}</div></div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${diffBanner}
+      ${series.map(item => `
+        <div class="env-group-card" style="--env-color:${getEnvColor(item.environment)};margin-bottom:0">
+          <div class="env-group-header" style="padding:8px 10px">
+            <div class="env-group-title" style="font-size:12px"><span class="env-dot"></span>${getEnvName(item.environment)}</div>
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">${item.downsampled_count} 点</span>
+          </div>
+          <div class="env-mini-grid" style="padding:10px">
+            <div class="env-mini-stat"><div class="env-mini-label">当前</div><div class="env-mini-value">${item.current?.toFixed(2) ?? '-'}</div></div>
+            <div class="env-mini-stat"><div class="env-mini-label">均值</div><div class="env-mini-value">${item.avg?.toFixed(2) ?? '-'}</div></div>
+            <div class="env-mini-stat"><div class="env-mini-label">最小</div><div class="env-mini-value">${item.min?.toFixed(2) ?? '-'}</div></div>
+            <div class="env-mini-stat"><div class="env-mini-label">最大</div><div class="env-mini-value">${item.max?.toFixed(2) ?? '-'}</div></div>
+          </div>
+        </div>`).join('')}
     </div>
   `;
 }
 
-function renderHistoryTable(data) {
+function renderHistoryTable(series) {
   const tbody = document.getElementById('historyTableBody');
-  document.getElementById('historyDataCount').textContent = `${data.length} 条`;
+  const rows = series.flatMap(item =>
+    (item.data || []).map(point => ({ ...point, environment: item.environment }))
+  );
+  document.getElementById('historyDataCount').textContent = `${rows.length} 条`;
 
-  tbody.innerHTML = data.slice(-100).reverse().map(p => `
+  tbody.innerHTML = rows.slice(-100).reverse().map(p => `
     <tr>
       <td style="font-family:var(--font-mono);font-size:11px">${formatTime(p.t)}</td>
+      <td><span class="env-dot" style="--env-color:${getEnvColor(p.environment)}"></span>${getEnvName(p.environment)}</td>
       <td style="font-family:var(--font-mono);font-weight:600">${p.v?.toFixed(4) ?? '-'}</td>
       <td>${p.src || '-'}</td>
       <td style="font-size:11px;color:var(--text-muted)">${JSON.stringify(p.tags || {})}</td>
@@ -2056,21 +2339,36 @@ function renderHistoryTable(data) {
   `).join('');
 }
 
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
 function exportHistory() {
-  if (!state.historyData?.data?.length) {
+  const series = state.historyData?.series || [];
+  if (!series.some(item => item.data?.length)) {
     showToast('无数据可导出', 'error');
     return;
   }
-  const rows = [['timestamp', 'value', 'source', 'tags']];
-  state.historyData.data.forEach(p => {
-    rows.push([new Date(p.t * 1000).toISOString(), p.v, p.src || '', JSON.stringify(p.tags || {})]);
+  const rows = [['timestamp', 'environment', 'metric', 'value', 'source', 'tags']];
+  series.forEach(item => {
+    item.data.forEach(p => {
+      rows.push([
+        new Date(p.t * 1000).toISOString(),
+        item.environment,
+        state.historyData.metric,
+        p.v,
+        p.src || '',
+        JSON.stringify(p.tags || {})
+      ]);
+    });
   });
-  const csv = rows.map(r => r.join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
+  const csv = rows.map(row => row.map(csvEscape).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `timeseries_export_${Date.now()}.csv`;
+  a.download = `timeseries_compare_${state.historyData.metric}_${Date.now()}.csv`;
   a.click();
   URL.revokeObjectURL(url);
   showToast('导出完成', 'success');
@@ -2124,7 +2422,7 @@ function renderAlerts() {
       <div class="alert-item">
         <div class="alert-severity ${a.severity || 'warning'}"></div>
         <div class="alert-content">
-          <div class="alert-title">${a.metric} · ${a.rule_name || a.algorithm || '异常'}</div>
+          <div class="alert-title">${a.metric} · ${getEnvName(a.environment || a.tags?.env || 'default')} · ${a.rule_name || a.algorithm || '异常'}</div>
           <div class="alert-meta">
             <span class="badge badge-${severityClass}">${a.severity || 'warning'}</span>
             <span>值: <strong>${a.value?.toFixed(2) ?? '-'}</strong></span>

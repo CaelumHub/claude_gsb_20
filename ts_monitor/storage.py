@@ -1,6 +1,7 @@
 """
 Time-Series Storage Engine
 - Hourly JSON shard files for time-series data
+- Environment-aware series and metadata
 - Separate metadata and rules storage
 - Cross-shard query with efficient merging
 - Write-ahead buffer for high-throughput ingestion
@@ -14,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
+
 class TimeSeriesStorage:
     """Manages time-series data with hourly JSON shard files."""
 
@@ -26,21 +28,61 @@ class TimeSeriesStorage:
 
         os.makedirs(self.ts_dir, exist_ok=True)
 
-        # Write buffer for high-throughput ingestion
-        self._write_buffer: Dict[str, List[Dict]] = defaultdict(list)
+        # Write buffer for high-throughput ingestion, keyed by (metric, environment)
+        self._write_buffer: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
         self._buffer_lock = threading.Lock()
         self._buffer_flush_interval = 2.0  # seconds
         self._last_flush = time.time()
 
         # In-memory cache for recent data (last 2 hours)
-        self._cache: Dict[str, List[Dict]] = defaultdict(list)
+        self._cache: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
         self._cache_lock = threading.Lock()
         self._max_cache_points = 50000
 
         # Load metadata and rules
-        self.metadata = self._load_json(self.meta_file, {"sources": {}, "stats": {}})
+        self.metadata = self._load_json(self.meta_file, {
+            "sources": {},
+            "stats": {},
+            "series": {}
+        })
+        self.metadata.setdefault("sources", {})
+        self.metadata.setdefault("stats", {})
+        self.metadata.setdefault("series", {})
         self.rules = self._load_json(self.rules_file, {"rules": []})
         self.alerts = self._load_json(self.alerts_file, {"alerts": [], "suppressed": {}})
+
+    @staticmethod
+    def normalize_environment(environment: Optional[str]) -> str:
+        """Normalize an environment identifier."""
+        env = str(environment or "default").strip()
+        return env or "default"
+
+    @staticmethod
+    def _safe_id(value: str) -> str:
+        """Convert an identifier to a file-safe name."""
+        safe = []
+        for ch in str(value):
+            if ch.isalnum() or ch in ("-", "_"):
+                safe.append(ch)
+            else:
+                safe.append("_")
+        return "".join(safe) or "default"
+
+    def _series_key(self, metric: str, environment: Optional[str] = None) -> Tuple[str, str]:
+        """Return the canonical in-memory series key."""
+        return metric, self.normalize_environment(environment)
+
+    def _register_series(self, metric: str, environment: str):
+        """Record the original names represented by a file-safe shard key."""
+        safe_metric = self._safe_id(metric.replace(".", "_").replace("/", "_").replace(" ", "_"))
+        safe_env = self._safe_id(environment)
+        key = f"{safe_metric}__{safe_env}"
+        if key not in self.metadata["series"]:
+            self.metadata["series"][key] = {
+                "metric": metric,
+                "environment": environment
+            }
+            self._save_json(self.meta_file, self.metadata)
 
     def _load_json(self, path: str, default: Any) -> Any:
         """Load JSON file with fallback to default."""
@@ -64,71 +106,87 @@ class TimeSeriesStorage:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    def _get_shard_path(self, metric: str, timestamp: float) -> str:
-        """Get the hourly shard file path for a metric and timestamp."""
+    def _get_shard_path(self, metric: str, timestamp: float,
+                        environment: Optional[str] = None) -> str:
+        """Get the hourly shard file path for a metric, environment, and timestamp."""
+        env = self.normalize_environment(environment)
         dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
         shard_key = dt.strftime("%Y%m%d_%H")
-        safe_metric = metric.replace("/", "_").replace(".", "_").replace(" ", "_")
-        return os.path.join(self.ts_dir, f"{safe_metric}_{shard_key}.json")
-
-    def _get_shard_key(self, metric: str, timestamp: float) -> str:
-        """Get the shard key for caching."""
-        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        return f"{metric}_{dt.strftime('%Y%m%d_%H')}"
+        safe_metric = self._safe_id(metric.replace("/", "_").replace(".", "_").replace(" ", "_"))
+        safe_env = self._safe_id(env)
+        return os.path.join(self.ts_dir, f"{safe_metric}__{safe_env}_{shard_key}.json")
 
     def write(self, metric: str, timestamp: float, value: float,
-              tags: Optional[Dict[str, str]] = None, source: str = "default"):
+              tags: Optional[Dict[str, Any]] = None, source: str = "default",
+              environment: Optional[str] = None):
         """Write a single data point to the write buffer."""
+        env = self.normalize_environment(
+            environment or (tags or {}).get("env") or (tags or {}).get("environment")
+        )
+        point_tags = dict(tags or {})
+        point_tags["env"] = env
+
         point = {
-            "t": round(timestamp, 3),
-            "v": value,
-            "tags": tags or {},
+            "t": round(float(timestamp), 3),
+            "v": float(value),
+            "tags": point_tags,
             "src": source
         }
+        cache_key = self._series_key(metric, env)
 
         with self._buffer_lock:
-            self._write_buffer[metric].append(point)
+            self._register_series(metric, env)
+            self._write_buffer[cache_key].append(point)
             # Auto-flush if buffer is large enough
-            if len(self._write_buffer[metric]) >= 1000 or \
+            if len(self._write_buffer[cache_key]) >= 1000 or \
                (time.time() - self._last_flush) > self._buffer_flush_interval:
-                self._flush_buffer()
+                self._flush_buffer_locked()
 
         # Update cache
         with self._cache_lock:
-            self._cache[metric].append(point)
+            self._cache[cache_key].append(point)
             # Trim cache if too large
-            if len(self._cache[metric]) > self._max_cache_points:
-                self._cache[metric] = self._cache[metric][-self._max_cache_points:]
+            if len(self._cache[cache_key]) > self._max_cache_points:
+                self._cache[cache_key] = self._cache[cache_key][-self._max_cache_points:]
 
     def write_batch(self, points: List[Dict[str, Any]]):
         """Write multiple data points efficiently."""
         with self._buffer_lock:
             for p in points:
                 metric = p.get("metric", "unknown")
+                env = self.normalize_environment(
+                    p.get("environment") or p.get("env") or
+                    (p.get("tags") or {}).get("env") or
+                    (p.get("tags") or {}).get("environment")
+                )
+                tags = dict(p.get("tags") or {})
+                tags["env"] = env
                 point = {
-                    "t": round(p.get("timestamp", time.time()), 3),
-                    "v": p.get("value", 0),
-                    "tags": p.get("tags", {}),
+                    "t": round(float(p.get("timestamp", time.time())), 3),
+                    "v": float(p.get("value", 0)),
+                    "tags": tags,
                     "src": p.get("source", "default")
                 }
-                self._write_buffer[metric].append(point)
+                cache_key = self._series_key(metric, env)
+                self._register_series(metric, env)
+                self._write_buffer[cache_key].append(point)
 
                 with self._cache_lock:
-                    self._cache[metric].append(point)
+                    self._cache[cache_key].append(point)
 
             if any(len(v) >= 500 for v in self._write_buffer.values()):
-                self._flush_buffer()
+                self._flush_buffer_locked()
 
-    def _flush_buffer(self):
-        """Flush write buffer to shard files."""
+    def _flush_buffer_locked(self):
+        """Flush write buffer to shard files. Caller must hold the buffer lock."""
         if not self._write_buffer:
             return
 
         shards_to_write: Dict[str, List[Dict]] = defaultdict(list)
 
-        for metric, points in self._write_buffer.items():
+        for (metric, env), points in self._write_buffer.items():
             for point in points:
-                shard_path = self._get_shard_path(metric, point["t"])
+                shard_path = self._get_shard_path(metric, point["t"], env)
                 shards_to_write[shard_path].append(point)
 
         for shard_path, points in shards_to_write.items():
@@ -141,13 +199,13 @@ class TimeSeriesStorage:
                     existing = []
 
             existing.extend(points)
-            # Sort by timestamp and deduplicate
+            # Sort by timestamp and deduplicate points from the same series/source.
             existing.sort(key=lambda x: x["t"])
-            # Remove exact duplicates
             seen = set()
             unique = []
             for p in existing:
-                key = (p["t"], p["v"])
+                tag_key = tuple(sorted((p.get("tags") or {}).items()))
+                key = (p["t"], p["v"], p.get("src", ""), tag_key)
                 if key not in seen:
                     seen.add(key)
                     unique.append(p)
@@ -168,17 +226,25 @@ class TimeSeriesStorage:
         self._write_buffer.clear()
         self._last_flush = time.time()
 
+    def _flush_buffer(self):
+        """Flush the buffer while acquiring the buffer lock."""
+        with self._buffer_lock:
+            self._flush_buffer_locked()
+
     def force_flush(self):
         """Force flush all buffered data."""
-        with self._buffer_lock:
-            self._flush_buffer()
+        self._flush_buffer()
 
     def query(self, metric: str, start: float, end: float,
               tags: Optional[Dict[str, str]] = None,
-              max_points: int = 10000) -> List[Dict]:
-        """Query time-series data across shards."""
+              max_points: int = 10000,
+              environment: Optional[str] = None) -> List[Dict]:
+        """Query one time-series across hourly shards."""
         self.force_flush()
 
+        env = self.normalize_environment(environment)
+        required_tags = dict(tags or {})
+        required_tags["env"] = env
         results = []
 
         # Determine which hourly shards to read
@@ -187,16 +253,16 @@ class TimeSeriesStorage:
 
         current = start_dt.replace(minute=0, second=0, microsecond=0)
         while current <= end_dt + timedelta(hours=1):
-            shard_path = self._get_shard_path(metric, current.timestamp())
+            shard_path = self._get_shard_path(metric, current.timestamp(), env)
             if os.path.exists(shard_path):
                 try:
                     with open(shard_path, 'r') as f:
                         points = json.load(f)
-                    # Filter by time range
                     filtered = [p for p in points if start <= p["t"] <= end]
-                    if tags:
-                        filtered = [p for p in filtered
-                                   if all(p.get("tags", {}).get(k) == v for k, v in tags.items())]
+                    filtered = [
+                        p for p in filtered
+                        if all(p.get("tags", {}).get(k) == v for k, v in required_tags.items())
+                    ]
                     results.extend(filtered)
                 except (json.JSONDecodeError, IOError):
                     pass
@@ -204,18 +270,20 @@ class TimeSeriesStorage:
 
         # Also check cache for very recent data
         with self._cache_lock:
-            cache_points = self._cache.get(metric, [])
-            cache_filtered = [p for p in cache_points if start <= p["t"] <= end]
-            if tags:
-                cache_filtered = [p for p in cache_filtered
-                                 if all(p.get("tags", {}).get(k) == v for k, v in tags.items())]
-            results.extend(cache_filtered)
+            cache_points = list(self._cache.get(self._series_key(metric, env), []))
+        cache_filtered = [p for p in cache_points if start <= p["t"] <= end]
+        cache_filtered = [
+            p for p in cache_filtered
+            if all(p.get("tags", {}).get(k) == v for k, v in required_tags.items())
+        ]
+        results.extend(cache_filtered)
 
         # Deduplicate and sort
         seen = set()
         unique = []
         for p in sorted(results, key=lambda x: x["t"]):
-            key = (p["t"], p["v"])
+            tag_key = tuple(sorted((p.get("tags") or {}).items()))
+            key = (p["t"], p["v"], p.get("src", ""), tag_key)
             if key not in seen:
                 seen.add(key)
                 unique.append(p)
@@ -228,20 +296,31 @@ class TimeSeriesStorage:
         return unique
 
     def get_metrics(self) -> List[str]:
-        """Get list of all available metrics."""
-        metrics = set()
-        # Scan shard files
-        if os.path.exists(self.ts_dir):
-            for fname in os.listdir(self.ts_dir):
-                if fname.endswith('.json'):
-                    # Extract metric name (everything before the date part)
-                    parts = fname.rsplit('_', 2)
-                    if len(parts) >= 3:
-                        metrics.add(parts[0])
-        # Also include cached metrics
+        """Get list of all available metric names."""
+        metrics = {item["metric"] for item in self.metadata.get("series", {}).values()}
         with self._cache_lock:
-            metrics.update(self._cache.keys())
+            metrics.update(metric for metric, _env in self._cache.keys())
         return sorted(metrics)
+
+    def get_environments(self) -> List[str]:
+        """Get all environments represented by configured sources or stored series."""
+        environments = {
+            item.get("environment")
+            for item in self.metadata.get("series", {}).values()
+            if item.get("environment")
+        }
+        environments.update(
+            source.get("environment") or source.get("env")
+            for source in self.get_sources().values()
+            if source.get("environment") or source.get("env")
+        )
+        with self._cache_lock:
+            environments.update(env for _metric, env in self._cache.keys())
+        environments.discard(None)
+        preferred = ["production", "staging", "development"]
+        ordered = [env for env in preferred if env in environments]
+        ordered.extend(sorted(environments - set(preferred)))
+        return ordered
 
     def get_shard_info(self) -> List[Dict]:
         """Get information about shard files."""
@@ -266,9 +345,11 @@ class TimeSeriesStorage:
 
     def add_source(self, source_id: str, config: Dict) -> Dict:
         """Add or update a data source."""
+        env = self.normalize_environment(config.get("environment") or config.get("env"))
         self.metadata["sources"][source_id] = {
             **config,
             "id": source_id,
+            "environment": env,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         self._save_json(self.meta_file, self.metadata)
@@ -315,6 +396,7 @@ class TimeSeriesStorage:
 
     def get_alerts(self, status: Optional[str] = None,
                    severity: Optional[str] = None,
+                   environment: Optional[str] = None,
                    limit: int = 200) -> List[Dict]:
         """Get alerts with optional filtering."""
         alerts = self.alerts.get("alerts", [])
@@ -322,12 +404,24 @@ class TimeSeriesStorage:
             alerts = [a for a in alerts if a.get("status") == status]
         if severity:
             alerts = [a for a in alerts if a.get("severity") == severity]
+        if environment:
+            alerts = [
+                a for a in alerts
+                if (a.get("environment") or a.get("env") or
+                    (a.get("tags") or {}).get("env")) == environment
+            ]
         return sorted(alerts, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
 
     def add_alert(self, alert: Dict) -> Dict:
         """Add a new alert with deduplication."""
         alert_id = alert.get("id", f"alert_{int(time.time()*1000)}")
+        env = self.normalize_environment(
+            alert.get("environment") or alert.get("env") or
+            (alert.get("tags") or {}).get("env")
+        )
         alert["id"] = alert_id
+        alert["environment"] = env
+        alert.setdefault("tags", {})["env"] = env
         alert["timestamp"] = alert.get("timestamp", time.time())
         alert["status"] = alert.get("status", "active")
 
@@ -335,9 +429,9 @@ class TimeSeriesStorage:
         suppressed = self.alerts.get("suppressed", {})
         metric = alert.get("metric", "")
         rule_id = alert.get("rule_id", "")
-        suppress_key = f"{metric}:{rule_id}"
+        suppress_key = f"{env}:{metric}:{rule_id}"
 
-        # Suppress if same metric+rule had an alert in the last 5 minutes
+        # Suppress if same environment+metric+rule alerted in the last 5 minutes
         if suppress_key in suppressed:
             last_alert_time = suppressed[suppress_key]
             if time.time() - last_alert_time < 300:  # 5 min suppression
@@ -401,6 +495,7 @@ class TimeSeriesStorage:
             "total_size_bytes": total_size,
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "metric_count": len(self.get_metrics()),
+            "environment_count": len(self.get_environments()),
             "source_count": len(self.get_sources()),
             "rule_count": len(self.get_rules()),
             "alert_count": len(self.alerts.get("alerts", [])),
