@@ -6,6 +6,7 @@ Time-Series Monitoring Server
 """
 
 import json
+import os
 import time
 import threading
 import random
@@ -14,17 +15,90 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from storage import TimeSeriesStorage
 from anomaly import AnomalyDetector
 from downsample import downsample_simple
 
 
+# The three environments being monitored. Each has its own independent
+# data source; a data point belongs to an environment via tags.env.
+DEFAULT_ENVS = ["production", "staging", "development"]
+ENV_COLORS = {
+    "production": "#ef4444",
+    "staging": "#f59e0b",
+    "development": "#10b981",
+}
+ENV_LABELS = {
+    "production": "生产",
+    "staging": "预发",
+    "development": "开发",
+}
+
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Multi-threaded HTTP server."""
     daemon_threads = True
     allow_reuse_address = True
+
+
+def _point_env(points_tags: dict) -> str:
+    """Extract environment from a point's tags, defaulting to 'default'."""
+    return (points_tags or {}).get("env", "default")
+
+
+def _parse_envs(query: Dict) -> Optional[List[str]]:
+    """Parse repeated 'env' query params (?env=production&env=staging).
+
+    Also accepts 'envs' and comma-separated values for convenience.
+    """
+    envs = query.get("env") or query.get("envs")
+    if not envs:
+        return None
+    # Support both repeated params and a comma-separated value
+    result = []
+    for raw in envs:
+        result.extend(e.strip() for e in raw.split(",") if e.strip())
+    return result or None
+
+
+def _run_rules_on_point(storage: TimeSeriesStorage, detector: AnomalyDetector,
+                        metric: str, value: float, timestamp: float,
+                        source: str, tags: dict, env: str):
+    """Evaluate all applicable rules for one point; persist alerts.
+
+    Rule matching honors an optional rule-level ``env`` scope. A rule with
+    no env applies to every environment; a scoped rule only matches its env.
+    Detection state is keyed by (metric, env) so environments never pollute
+    each other's baselines.
+    """
+    alerts = []
+    state_key = f"{env}::{metric}"
+    for rule in storage.get_rules():
+        if rule.get("metric") != metric or not rule.get("enabled", True):
+            continue
+        rule_env = rule.get("env")
+        if rule_env and rule_env != env:
+            continue
+        is_anomaly, result = detector.detect(state_key, float(value), rule)
+        if is_anomaly:
+            alert = {
+                "metric": metric,
+                "env": env,
+                "value": float(value),
+                "rule_id": rule.get("id"),
+                "rule_name": rule.get("name", "Unknown"),
+                "algorithm": rule.get("algorithm"),
+                "severity": rule.get("severity", "warning"),
+                "score": result.get("score"),
+                "details": result.get("details"),
+                "timestamp": float(timestamp),
+                "source": source,
+                "tags": tags,
+            }
+            alerts.append(storage.add_alert(alert))
+    return alerts
 
 
 class TimeSeriesHandler(BaseHTTPRequestHandler):
@@ -92,7 +166,9 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             elif path == '/api/data/downsample':
                 self._handle_downsample(query)
             elif path == '/api/data/metrics':
-                self._handle_metrics()
+                self._handle_metrics(query)
+            elif path == '/api/data/environments':
+                self._handle_environments()
             elif path == '/api/dashboard':
                 self._handle_dashboard(query)
             elif path == '/api/alerts':
@@ -173,8 +249,12 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         metric = body.get("metric")
         value = body.get("value")
         timestamp = body.get("timestamp", time.time())
-        tags = body.get("tags", {})
+        tags = body.get("tags", {}) or {}
         source = body.get("source", "default")
+
+        # Environment can be supplied either as a top-level field or via tags.env
+        env = body.get("env") or tags.get("env") or "default"
+        tags = {**tags, "env": env}
 
         if not metric or value is None:
             self._send_error("Missing 'metric' or 'value'")
@@ -183,31 +263,17 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         # Store the data point
         self.storage.write(metric, float(timestamp), float(value), tags, source)
 
-        # Run anomaly detection
-        anomaly_result = None
-        for rule in self.storage.get_rules():
-            if rule.get("metric") == metric and rule.get("enabled", True):
-                is_anomaly, result = self.detector.detect(metric, float(value), rule)
-                if is_anomaly:
-                    alert = {
-                        "metric": metric,
-                        "value": float(value),
-                        "rule_id": rule.get("id"),
-                        "rule_name": rule.get("name", "Unknown"),
-                        "algorithm": rule.get("algorithm"),
-                        "severity": rule.get("severity", "warning"),
-                        "score": result.get("score"),
-                        "details": result.get("details"),
-                        "timestamp": float(timestamp),
-                        "source": source,
-                        "tags": tags
-                    }
-                    saved_alert = self.storage.add_alert(alert)
-                    anomaly_result = saved_alert
+        # Run anomaly detection (state isolated per environment)
+        alerts = _run_rules_on_point(
+            self.storage, self.detector, metric, float(value),
+            float(timestamp), source, tags, env
+        )
+        anomaly_result = alerts[0] if alerts else None
 
         self._send_json({
             "success": True,
             "metric": metric,
+            "env": env,
             "timestamp": float(timestamp),
             "anomaly_detected": anomaly_result is not None,
             "alert": anomaly_result
@@ -222,31 +288,24 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             self._send_error("Missing 'points' array")
             return
 
+        # Normalize env onto tags before storage
+        for p in points:
+            tags = p.get("tags", {}) or {}
+            env = p.get("env") or tags.get("env") or "default"
+            p["tags"] = {**tags, "env": env}
+            p["env"] = env
+
         self.storage.write_batch(points)
 
-        # Run anomaly detection on each point
+        # Run anomaly detection on each point (per-environment state)
         anomalies = []
         for p in points:
-            metric = p.get("metric", "")
-            value = p.get("value", 0)
-            for rule in self.storage.get_rules():
-                if rule.get("metric") == metric and rule.get("enabled", True):
-                    is_anomaly, result = self.detector.detect(metric, float(value), rule)
-                    if is_anomaly:
-                        alert = {
-                            "metric": metric,
-                            "value": float(value),
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": p.get("timestamp", time.time()),
-                            "source": p.get("source", "default")
-                        }
-                        saved = self.storage.add_alert(alert)
-                        anomalies.append(saved)
+            anomalies.extend(_run_rules_on_point(
+                self.storage, self.detector,
+                p.get("metric", ""), float(p.get("value", 0)),
+                float(p.get("timestamp", time.time())),
+                p.get("source", "default"), p.get("tags", {}), p["env"]
+            ))
 
         self._send_json({
             "success": True,
@@ -256,80 +315,228 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_data_query(self, query: Dict):
-        """Query time-series data."""
+        """Query time-series data, optionally across multiple environments."""
         metric = query.get("metric", [None])[0]
         start = float(query.get("start", [time.time() - 3600])[0])
         end = float(query.get("end", [time.time()])[0])
         max_points = int(query.get("max_points", [1000])[0])
+        envs = _parse_envs(query)
+        grouped = query.get("grouped", ["0"])[0] in ("1", "true", "yes")
 
         if not metric:
             self._send_error("Missing 'metric' parameter")
             return
 
-        data = self.storage.query(metric, start, end, max_points=max_points)
+        if grouped:
+            # One series per environment (used for overlay charts)
+            target_envs = envs or self._all_envs()
+            groups = {}
+            for env in target_envs:
+                groups[env] = self.storage.query(
+                    metric, start, end, envs=[env], max_points=max_points
+                )
+            self._send_json({
+                "metric": metric,
+                "start": start,
+                "end": end,
+                "grouped": True,
+                "envs": target_envs,
+                "groups": groups,
+                "count": sum(len(v) for v in groups.values())
+            })
+            return
+
+        data = self.storage.query(metric, start, end, envs=envs, max_points=max_points)
         self._send_json({
             "metric": metric,
             "start": start,
             "end": end,
+            "envs": envs or self._all_envs(),
             "count": len(data),
             "data": data
         })
 
     def _handle_downsample(self, query: Dict):
-        """Query with downsampling."""
+        """Query with downsampling. Supports multi-env grouped overlay queries."""
         metric = query.get("metric", [None])[0]
         start = float(query.get("start", [time.time() - 3600])[0])
         end = float(query.get("end", [time.time()])[0])
         target = int(query.get("target", [200])[0])
         method = query.get("method", ["lttb"])[0]
+        envs = _parse_envs(query)
+        grouped = query.get("grouped", ["0"])[0] in ("1", "true", "yes")
 
         if not metric:
             self._send_error("Missing 'metric' parameter")
             return
 
-        data = self.storage.query(metric, start, end, max_points=50000)
+        if grouped:
+            target_envs = envs or self._all_envs()
+            groups = {}
+            original_total = 0
+            for env in target_envs:
+                raw = self.storage.query(metric, start, end, envs=[env], max_points=50000)
+                original_total += len(raw)
+                groups[env] = downsample_simple(raw, target, method)
+            self._send_json({
+                "metric": metric,
+                "grouped": True,
+                "method": method,
+                "envs": target_envs,
+                "original_count": original_total,
+                "downsampled_count": sum(len(v) for v in groups.values()),
+                "groups": groups
+            })
+            return
+
+        data = self.storage.query(metric, start, end, envs=envs, max_points=50000)
         downsampled = downsample_simple(data, target, method)
 
         self._send_json({
             "metric": metric,
+            "envs": envs or self._all_envs(),
             "original_count": len(data),
             "downsampled_count": len(downsampled),
             "method": method,
             "data": downsampled
         })
 
-    def _handle_metrics(self):
-        """Get available metrics."""
-        metrics = self.storage.get_metrics()
-        self._send_json({"metrics": metrics})
+    def _handle_metrics(self, query: Dict):
+        """Get available metrics, plus the env -> metrics breakdown."""
+        env = query.get("env", [None])[0]
+        metrics = self.storage.get_metrics(env)
+        env_metrics = self.storage.get_environment_metrics()
+        self._send_json({
+            "metrics": metrics,
+            "env_metrics": env_metrics,
+            "envs": sorted(env_metrics.keys())
+        })
+
+    def _handle_environments(self):
+        """List environments: static config merged with observed live data."""
+        configured = self.storage.get_environments()
+        observed = self.storage.get_environment_metrics()
+        env_ids = list(dict.fromkeys(list(DEFAULT_ENVS) +
+                                     list(configured.keys()) +
+                                     list(observed.keys())))
+        result = {}
+        for env_id in env_ids:
+            result[env_id] = {
+                "id": env_id,
+                "label": ENV_LABELS.get(env_id, env_id),
+                "color": ENV_COLORS.get(env_id, "#3b82f6"),
+                "metrics": observed.get(env_id, []),
+                "metric_count": len(observed.get(env_id, [])),
+                **configured.get(env_id, {})
+            }
+        self._send_json({"environments": result, "count": len(result)})
+
+    def _all_envs(self) -> List[str]:
+        """All known environment ids (configured + observed)."""
+        configured = self.storage.get_environments()
+        observed = self.storage.get_environment_metrics()
+        return list(dict.fromkeys(list(DEFAULT_ENVS) +
+                                  list(configured.keys()) +
+                                  list(observed.keys())))
 
     def _handle_dashboard(self, query: Dict):
-        """Get dashboard summary data."""
-        now = time.time()
-        period = int(query.get("period", [300])[0])  # Last 5 minutes default
+        """Get dashboard summary data.
 
-        metrics = self.storage.get_metrics()
+        Query params:
+          period   - lookback window in seconds
+          env      - restrict to one environment
+          grouped=1 - return per-environment groups for cross-env comparison
+        """
+        now = time.time()
+        period = int(query.get("period", [300])[0])
+        env = query.get("env", [None])[0]
+        grouped = query.get("grouped", ["0"])[0] in ("1", "true", "yes")
+
+        def _summarize(metric: str, envs=None):
+            data = self.storage.query(metric, now - period, now,
+                                      envs=envs, max_points=200)
+            if not data:
+                return None
+            values = [p["v"] for p in data]
+            return {
+                "current": round(values[-1], 4),
+                "min": round(min(values), 4),
+                "max": round(max(values), 4),
+                "avg": round(sum(values) / len(values), 4),
+                "count": len(values),
+                "data": data[-50:]
+            }
+
+        if grouped:
+            # Per-environment summary of the same metrics, enabling
+            # cross-environment comparison of a metric's value difference.
+            target_envs = self._all_envs()
+            all_metrics = self.storage.get_metrics()[:20]
+            groups: Dict[str, Dict] = {}
+            comparison = []
+
+            for target_env in target_envs:
+                env_metrics = {}
+                for metric in all_metrics:
+                    summary = _summarize(metric, envs=[target_env])
+                    if summary:
+                        env_metrics[metric] = summary
+                groups[target_env] = env_metrics
+
+            # Build metric-centric comparison rows (env current values + delta)
+            baseline_env = "production" if "production" in target_envs else target_envs[0]
+            for metric in all_metrics:
+                row = {"metric": metric, "by_env": {}}
+                base_current = None
+                for target_env in target_envs:
+                    summary = groups[target_env].get(metric)
+                    if not summary:
+                        continue
+                    row["by_env"][target_env] = {
+                        "current": summary["current"],
+                        "avg": summary["avg"],
+                        "min": summary["min"],
+                        "max": summary["max"],
+                    }
+                if metric in groups.get(baseline_env, {}):
+                    base_current = groups[baseline_env][metric]["current"]
+                    row["baseline_env"] = baseline_env
+                    for target_env, vals in row["by_env"].items():
+                        vals["diff_vs_baseline"] = round(vals["current"] - base_current, 4)
+                if row["by_env"]:
+                    comparison.append(row)
+
+            self._send_json({
+                "timestamp": now,
+                "period": period,
+                "grouped": True,
+                "envs": target_envs,
+                "groups": groups,
+                "comparison": comparison,
+                "recent_alerts": self.storage.get_alerts(limit=10),
+                "stats": self.storage.get_stats()
+            })
+            return
+
+        metrics = self.storage.get_metrics(env)
+        envs_filter = [env] if env else None
         dashboard_data = {}
 
         for metric in metrics[:20]:  # Limit to 20 metrics
-            data = self.storage.query(metric, now - period, now, max_points=200)
-            if data:
-                values = [p["v"] for p in data]
-                dashboard_data[metric] = {
-                    "current": round(values[-1], 4) if values else 0,
-                    "min": round(min(values), 4),
-                    "max": round(max(values), 4),
-                    "avg": round(sum(values) / len(values), 4),
-                    "count": len(values),
-                    "data": data[-50:]  # Last 50 points for sparkline
-                }
+            summary = _summarize(metric, envs=envs_filter)
+            if summary:
+                dashboard_data[metric] = summary
 
         # Recent alerts
         recent_alerts = self.storage.get_alerts(limit=10)
+        if env:
+            recent_alerts = [a for a in recent_alerts
+                             if (a.get("env") or (a.get("tags") or {}).get("env", "default")) == env]
 
         self._send_json({
             "timestamp": now,
             "period": period,
+            "env": env,
             "metrics": dashboard_data,
             "recent_alerts": recent_alerts,
             "stats": self.storage.get_stats()
@@ -339,9 +546,13 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         """Get alerts list."""
         status = query.get("status", [None])[0]
         severity = query.get("severity", [None])[0]
+        env = query.get("env", [None])[0]
         limit = int(query.get("limit", [200])[0])
 
         alerts = self.storage.get_alerts(status=status, severity=severity, limit=limit)
+        if env:
+            alerts = [a for a in alerts
+                      if (a.get("env") or (a.get("tags") or {}).get("env", "default")) == env]
         self._send_json({"alerts": alerts, "count": len(alerts)})
 
     def _handle_acknowledge_alert(self):
@@ -414,16 +625,18 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         self._send_json({"state": state})
 
     def _handle_simulate(self):
-        """Trigger data simulation."""
+        """Trigger data simulation into one or more environments."""
         body = self._read_body()
         duration = body.get("duration", 60)
         interval = body.get("interval", 1)
         metrics = body.get("metrics", ["cpu.usage", "memory.usage", "disk.io", "network.throughput"])
+        # Optional: one environment or a list; defaults to all three
+        envs = body.get("envs") or ([body["env"]] if body.get("env") else DEFAULT_ENVS)
 
         # Start simulation in background
         sim_thread = threading.Thread(
             target=_run_simulation,
-            args=(self.storage, self.detector, metrics, duration, interval),
+            args=(self.storage, self.detector, metrics, duration, interval, envs),
             daemon=True
         )
         sim_thread.start()
@@ -431,7 +644,8 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         self._send_json({
             "success": True,
             "message": f"Simulation started for {duration}s",
-            "metrics": metrics
+            "metrics": metrics,
+            "envs": envs
         })
 
     def _serve_frontend(self):
@@ -462,28 +676,49 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
 
 # ---- Data Simulator ----
 
-class DataSimulator:
-    """Generates realistic time-series data with anomalies."""
+# Per-environment simulation profiles so the three independent data
+# sources visibly differ (production runs hottest, development coolest).
+ENV_PROFILES = {
+    "production":  {"base": (55, 75), "offset": 0},
+    "staging":     {"base": (32, 48), "offset": 0},
+    "development": {"base": (12, 25), "offset": 0},
+}
 
-    def __init__(self):
+
+class DataSimulator:
+    """Generates realistic time-series data with anomalies.
+
+    Passing ``seed`` gives each environment an independent RNG, so the
+    three environments produce distinct but internally consistent series.
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = random.Random(seed)
         self.trends = {}
         self.seasonal = {}
         self.anomaly_injection = {}
+        # Wall-clock origin; trend uses elapsed seconds so that the large
+        # epoch timestamp never dominates the base value.
+        self._t0 = time.time()
 
-    def generate(self, metric: str, timestamp: float) -> float:
+    def generate(self, metric: str, timestamp: float,
+                 profile: Optional[Dict] = None) -> float:
         """Generate a data point for a metric."""
+        profile = profile or {"base": (20, 80), "offset": 0}
+
         if metric not in self.trends:
+            lo, hi = profile["base"]
             self.trends[metric] = {
-                "base": random.uniform(20, 80),
-                "trend": random.uniform(-0.1, 0.1),
-                "season_period": random.choice([60, 300, 600, 1800]),
-                "season_amplitude": random.uniform(5, 20),
-                "noise_std": random.uniform(1, 5),
+                "base": self.rng.uniform(lo, hi) + profile.get("offset", 0),
+                "trend": self.rng.uniform(-0.1, 0.1),
+                "season_period": self.rng.choice([60, 300, 600, 1800]),
+                "season_amplitude": self.rng.uniform(5, 20),
+                "noise_std": self.rng.uniform(1, 5),
                 "last_value": None
             }
 
         state = self.trends[metric]
-        t = timestamp
+        t = timestamp - self._t0
 
         # Base value with trend
         base = state["base"] + state["trend"] * t
@@ -493,20 +728,20 @@ class DataSimulator:
 
         # Random walk component
         if state["last_value"] is not None:
-            walk = random.gauss(0, state["noise_std"] * 0.3)
+            walk = self.rng.gauss(0, state["noise_std"] * 0.3)
             value = state["last_value"] * 0.7 + (base + seasonal) * 0.3 + walk
         else:
-            value = base + seasonal + random.gauss(0, state["noise_std"])
+            value = base + seasonal + self.rng.gauss(0, state["noise_std"])
 
         # Inject anomalies occasionally (2% chance)
-        if random.random() < 0.02:
-            anomaly_type = random.choice(["spike", "dip", "shift"])
+        if self.rng.random() < 0.02:
+            anomaly_type = self.rng.choice(["spike", "dip", "shift"])
             if anomaly_type == "spike":
-                value += random.uniform(20, 50)
+                value += self.rng.uniform(20, 50)
             elif anomaly_type == "dip":
-                value -= random.uniform(20, 50)
+                value -= self.rng.uniform(20, 50)
             else:  # shift
-                value += random.uniform(-30, 30)
+                value += self.rng.uniform(-30, 30)
 
         # Clamp to reasonable range
         value = max(0, min(100, value))
@@ -516,9 +751,13 @@ class DataSimulator:
 
 
 def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
-                    metrics: list, duration: int, interval: float):
-    """Run data simulation in background."""
-    sim = DataSimulator()
+                    metrics: list, duration: int, interval: float,
+                    envs: Optional[List[str]] = None):
+    """Run data simulation in background, one independent generator per env."""
+    envs = envs or DEFAULT_ENVS
+    # Independent RNG + trend state per environment
+    sims = {env: DataSimulator(seed=abs(hash(("sim", env))) % (2**32))
+            for env in envs}
     start = time.time()
     count = 0
 
@@ -526,43 +765,33 @@ def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
         ts = time.time()
         points = []
 
-        for metric in metrics:
-            value = sim.generate(metric, ts)
-            points.append({
-                "metric": metric,
-                "timestamp": ts,
-                "value": value,
-                "source": "simulator",
-                "tags": {"env": "demo"}
-            })
+        for env in envs:
+            sim = sims[env]
+            profile = ENV_PROFILES.get(env, {"base": (20, 80), "offset": 0})
+            for metric in metrics:
+                value = sim.generate(metric, ts, profile)
+                points.append({
+                    "metric": metric,
+                    "timestamp": ts,
+                    "value": value,
+                    "source": f"simulator-{env}",
+                    "tags": {"env": env}
+                })
 
         storage.write_batch(points)
 
-        # Run anomaly detection
+        # Run anomaly detection (per-environment state)
         for p in points:
-            for rule in storage.get_rules():
-                if rule.get("metric") == p["metric"] and rule.get("enabled", True):
-                    is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
-                    if is_anomaly:
-                        alert = {
-                            "metric": p["metric"],
-                            "value": p["value"],
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": ts,
-                            "source": "simulator"
-                        }
-                        storage.add_alert(alert)
+            _run_rules_on_point(
+                storage, detector, p["metric"], p["value"], ts,
+                p["source"], p["tags"], p["tags"]["env"]
+            )
 
         count += len(points)
         time.sleep(interval)
 
     storage.force_flush()
-    print(f"Simulation complete: {count} data points generated")
+    print(f"Simulation complete: {count} data points across {len(envs)} environments")
 
 
 # ---- Server Startup ----
@@ -630,28 +859,59 @@ def create_default_rules(storage: TimeSeriesStorage):
 
 
 def create_default_sources(storage: TimeSeriesStorage):
-    """Create default data sources."""
+    """Create default data sources: one independent source per environment."""
     default_sources = {
-        "simulator": {
-            "name": "Local Simulator",
+        "simulator-production": {
+            "name": "生产环境数据源",
             "type": "simulator",
+            "env": "production",
             "enabled": True,
             "metrics": ["cpu.usage", "memory.usage", "disk.io", "network.throughput"],
             "interval": 1,
-            "description": "Built-in data simulator"
+            "description": "生产环境内置模拟器（独立数据源）"
+        },
+        "simulator-staging": {
+            "name": "预发环境数据源",
+            "type": "simulator",
+            "env": "staging",
+            "enabled": True,
+            "metrics": ["cpu.usage", "memory.usage", "disk.io", "network.throughput"],
+            "interval": 1,
+            "description": "预发环境内置模拟器（独立数据源）"
+        },
+        "simulator-development": {
+            "name": "开发环境数据源",
+            "type": "simulator",
+            "env": "development",
+            "enabled": True,
+            "metrics": ["cpu.usage", "memory.usage", "disk.io", "network.throughput"],
+            "interval": 1,
+            "description": "开发环境内置模拟器（独立数据源）"
         },
         "api": {
-            "name": "API Ingestion",
+            "name": "API 数据摄入",
             "type": "api",
             "enabled": True,
             "endpoint": "/api/data/ingest",
-            "description": "HTTP API data ingestion endpoint"
+            "description": "HTTP API 数据摄入端点（通过 tags.env 指定环境）"
         }
     }
 
     for sid, config in default_sources.items():
         if sid not in storage.get_sources():
             storage.add_source(sid, config)
+
+
+def create_default_environments(storage: TimeSeriesStorage):
+    """Register the three monitored environments."""
+    for env_id in DEFAULT_ENVS:
+        storage.add_environment(env_id, {
+            "name": {"production": "生产环境", "staging": "预发环境",
+                     "development": "开发环境"}[env_id],
+            "label": ENV_LABELS[env_id],
+            "color": ENV_COLORS[env_id],
+            "source": f"simulator-{env_id}",
+        })
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"):
@@ -668,6 +928,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
 
     # Create defaults
     create_default_rules(storage)
+    create_default_environments(storage)
     create_default_sources(storage)
 
     # Create server
@@ -681,46 +942,37 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
     print(f"║   Data:    {data_dir:<40s} ║")
     print(f"╚══════════════════════════════════════════════════════╝")
 
-    # Start auto-simulation
+    # Start auto-simulation: one independent generator per environment
     def auto_simulate():
         time.sleep(2)  # Wait for server to start
-        sim = DataSimulator()
         metrics = ["cpu.usage", "memory.usage", "disk.io", "network.throughput"]
+        sims = {env: DataSimulator(seed=abs(hash(("auto", env))) % (2**32))
+                for env in DEFAULT_ENVS}
 
         while True:
             ts = time.time()
             points = []
-            for metric in metrics:
-                value = sim.generate(metric, ts)
-                points.append({
-                    "metric": metric,
-                    "timestamp": ts,
-                    "value": value,
-                    "source": "auto-simulator",
-                    "tags": {"env": "production"}
-                })
+            for env in DEFAULT_ENVS:
+                sim = sims[env]
+                profile = ENV_PROFILES.get(env, {"base": (20, 80), "offset": 0})
+                for metric in metrics:
+                    value = sim.generate(metric, ts, profile)
+                    points.append({
+                        "metric": metric,
+                        "timestamp": ts,
+                        "value": value,
+                        "source": f"simulator-{env}",
+                        "tags": {"env": env}
+                    })
 
             storage.write_batch(points)
 
-            # Anomaly detection
+            # Anomaly detection with per-environment state
             for p in points:
-                for rule in storage.get_rules():
-                    if rule.get("metric") == p["metric"] and rule.get("enabled", True):
-                        is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
-                        if is_anomaly:
-                            alert = {
-                                "metric": p["metric"],
-                                "value": p["value"],
-                                "rule_id": rule.get("id"),
-                                "rule_name": rule.get("name", "Unknown"),
-                                "algorithm": rule.get("algorithm"),
-                                "severity": rule.get("severity", "warning"),
-                                "score": result.get("score"),
-                                "details": result.get("details"),
-                                "timestamp": ts,
-                                "source": "auto-simulator"
-                            }
-                            storage.add_alert(alert)
+                _run_rules_on_point(
+                    storage, detector, p["metric"], p["value"], ts,
+                    p["source"], p["tags"], p["tags"]["env"]
+                )
 
             time.sleep(1)
 

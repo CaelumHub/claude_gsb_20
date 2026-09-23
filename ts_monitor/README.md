@@ -32,11 +32,26 @@ python3 server.py 8080
 
 ### 前端（5 个页面）
 
-1. **实时仪表盘** - ECharts 多指标曲线图、热力图、统计卡片
-2. **数据源配置** - 管理 API/模拟器/文件数据源
-3. **历史查询** - 时间范围选择、LTTB 降采样、CSV 导出
-4. **异常告警** - 告警列表、状态过滤、确认/解决操作
-5. **规则管理** - CRUD 检测规则、多算法配置
+1. **实时仪表盘** - 环境切换（生产/预发/开发）、跨环境分组对比表、多环境叠加曲线图、环境×指标热力图、统计卡片
+2. **数据源配置** - 每个环境绑定独立数据源、按环境模拟器控制
+3. **历史查询** - 指标选择 + 多环境多选、跨环境同指标叠加、LTTB 降采样、CSV 导出（含环境列）
+4. **异常告警** - 按环境/状态/级别过滤、确认/解决操作
+5. **规则管理** - CRUD 检测规则、多算法配置、规则级环境作用域
+
+### 多环境监控
+
+环境（`env`）是一等维度：每个数据点通过 `tags.env` 归属一个环境
+（`production` / `staging` / `development`），三个环境各有独立数据源。
+
+| 能力 | 实现方式 |
+|------|----------|
+| 按环境分组查看 | 仪表盘环境切换器；`/api/dashboard?env=xxx` 单环境视图 |
+| 跨环境对比同一指标 | `/api/dashboard?grouped=1` 返回每环境统计及相对生产基线的差值 |
+| 历史多环境叠加 | `/api/data/downsample?grouped=1&envs=a&envs=b` 每环境独立降采样后返回多序列 |
+| 环境元数据 | `/api/data/environments` 返回环境标签、颜色、所含指标 |
+| 检测隔离 | 检测器滑动窗口按 `env::metric` 隔离，环境间基线互不污染 |
+| 规则作用域 | 规则可选 `env`，为空则对所有环境生效 |
+| 告警归属 | 告警带 `env` 字段，去重窗口按 `环境+指标+规则` 计算 |
 
 ### 后端核心能力
 
@@ -56,15 +71,15 @@ python3 server.py 8080
 ### 数据摄入
 
 ```bash
-# 单点摄入
+# 单点摄入（顶层 env 或 tags.env 均可）
 curl -X POST http://localhost:8080/api/data/ingest \
   -H "Content-Type: application/json" \
-  -d '{"metric":"cpu.usage","value":72.5,"timestamp":1695000000}'
+  -d '{"metric":"cpu.usage","value":72.5,"timestamp":1695000000,"env":"production"}'
 
-# 批量摄入
+# 批量摄入（多个环境的数据点可在同一批次）
 curl -X POST http://localhost:8080/api/data/ingest/batch \
   -H "Content-Type: application/json" \
-  -d '{"points":[{"metric":"cpu.usage","value":72.5},{"metric":"mem","value":4.2}]}'
+  -d '{"points":[{"metric":"cpu.usage","value":72.5,"env":"production"},{"metric":"cpu.usage","value":40.1,"env":"staging"}]}'
 ```
 
 ### 数据查询
@@ -75,6 +90,15 @@ curl "http://localhost:8080/api/data/query?metric=cpu.usage&start=1695000000&end
 
 # 降采样查询
 curl "http://localhost:8080/api/data/downsample?metric=cpu.usage&start=1695000000&end=1695003600&target=200&method=lttb"
+
+# 多环境叠加查询（同一指标，每环境一条降采样序列）
+curl "http://localhost:8080/api/data/downsample?metric=cpu.usage&grouped=1&envs=production,staging,development&target=200"
+
+# 仪表盘按环境分组对比
+curl "http://localhost:8080/api/dashboard?grouped=1"
+
+# 环境清单
+curl "http://localhost:8080/api/data/environments"
 ```
 
 ### 规则管理
@@ -134,12 +158,15 @@ data/timeseries/
 
 ```json
 {
-  "t": 1695000000.123,  // 时间戳（秒，保留3位小数）
-  "v": 72.5,            // 值
-  "tags": {"host": "s1"}, // 标签
-  "src": "api"           // 来源
+  "t": 1695000000.123,     // 时间戳（秒，保留3位小数）
+  "v": 72.5,               // 值
+  "tags": {"host": "s1", "env": "production"}, // 标签；env 标识所属环境
+  "src": "simulator-production"  // 来源（各环境独立数据源）
 }
 ```
+
+同一指标在不同环境的数据保存在同一分片文件中，按 `tags.env` 区分；去重以
+`(时间戳, 值, 环境, 来源)` 为键，避免不同环境的相同读数被错误合并。
 
 ## 异常检测算法
 
